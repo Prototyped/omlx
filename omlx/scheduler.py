@@ -1550,6 +1550,15 @@ _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
 _CONTENDED_CHUNK_GRID = 64
 _DECODE_ACTIVITY_TTL_S = 2.5
 
+# llama.cpp-style periodic prompt-processing (prefill) progress logging: one
+# INFO line every N tokens of prompt processed, per request, regardless of
+# how the adaptive/contended/memory-guard throttles size individual chunks.
+# 0 (or negative) disables the periodic log; the final chunk of a prefill
+# always still logs so 100% is always visible.
+_PREFILL_LOG_INTERVAL_TOKENS = int(
+    os.environ.get("OMLX_PREFILL_LOG_INTERVAL", "2048")
+)
+
 
 # Fraction of the room between current usage and the enforcer's abort
 # watermark that one prefill chunk may plan to consume once the sizing target
@@ -2154,6 +2163,13 @@ class Scheduler:
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
         self.uid_to_request_id: dict[int, str] = {}
+
+        # Periodic prefill progress logging state (see _log_prefill_progress
+        # / OMLX_PREFILL_LOG_INTERVAL). request_id -> tokens processed as of
+        # the last emitted log line, and request_id -> perf_counter() at the
+        # start of that request's prefill (for a tok/s figure).
+        self._prefill_log_last_count: dict[str, int] = {}
+        self._prefill_log_start_time: dict[str, float] = {}
 
         # BatchGenerator - the actual batching engine
         self.batch_generator: BatchGenerator | None = None
@@ -3204,6 +3220,55 @@ class Scheduler:
                 total=total,
                 model_id=model_id,
             )
+            self._log_prefill_progress(request_id, processed, total)
+
+    def _log_prefill_progress(
+        self, request_id: str, processed: int, total: int
+    ) -> None:
+        """Emit a periodic prompt-processing (prefill) progress log line.
+
+        Mirrors llama.cpp's prompt-eval progress logging: one INFO line
+        every ``OMLX_PREFILL_LOG_INTERVAL`` tokens (default 2048) of prompt
+        processed, plus a final line when the request's prefill completes,
+        so 100% is always reported even if the last chunk is shorter than
+        the interval. Called once per prefill chunk from both the external
+        (single-request) prefill loop and the chunked/BatchGenerator prefill
+        loop, so the cadence is identical on either code path regardless of
+        how large any individual chunk actually was (adaptive throttling,
+        memory-guard shrinkage, and contended-decode capping can all make
+        chunks smaller than prefill_step_size).
+
+        Args:
+            request_id: The request whose prefill is progressing.
+            processed: Tokens of the prompt processed so far (cumulative).
+            total: Total tokens to be prefilled for this request.
+        """
+        if _PREFILL_LOG_INTERVAL_TOKENS <= 0:
+            return
+        now = time.perf_counter()
+        start = self._prefill_log_start_time.setdefault(request_id, now)
+        last_logged = self._prefill_log_last_count.get(request_id, 0)
+        done = processed >= total
+        if processed - last_logged < _PREFILL_LOG_INTERVAL_TOKENS and not done:
+            return
+        elapsed = max(now - start, 1e-6)
+        pct = (100.0 * processed / total) if total > 0 else 100.0
+        logger.info(
+            "prompt processing: rid=%s %d/%d tokens (%.1f%%) | %.1f tok/s",
+            request_id,
+            processed,
+            total,
+            pct,
+            processed / elapsed,
+        )
+        self._prefill_log_last_count[request_id] = processed
+        if done:
+            # Prefill for this request is finished — drop the bookkeeping so
+            # a later request that happens to reuse the same request_id (or
+            # a retried/requeued prefill) starts its own interval from zero
+            # instead of inheriting a stale processed count.
+            self._prefill_log_last_count.pop(request_id, None)
+            self._prefill_log_start_time.pop(request_id, None)
 
     # ------------------------------------------------------------------
     # External prefill (composition pattern — replaces _process_prompts)
@@ -5622,6 +5687,11 @@ class Scheduler:
                 if self.config.model_name
                 else ""
             ),
+        )
+        self._log_prefill_progress(
+            state.request.request_id,
+            state.tokens_processed,
+            state.total_length - 1,
         )
 
         # Memory monitoring — use max(active, phys_footprint) so MLX cache
